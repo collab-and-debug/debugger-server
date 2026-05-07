@@ -2,94 +2,91 @@ const express   = require('express');
 const http      = require('http');
 const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
+const { createClient } = require('redis');
 
 const app = express();
 app.use(express.json());
 
-// ─── In-memory session store ────────────────────────────
-const sessions = new Map();
-let messageSequence = 0;
+// ─── Redis setup ─────────────────────────────────────────
+// two clients needed - one cant both publish and subscribe at the same time
+const publisher  = createClient({ url: process.env.REDIS_URL });
+const subscriber = createClient({ url: process.env.REDIS_URL });
 
-// ─── HTTP + WebSocket server ────────────────────────────
-const server = http.createServer(app);
-const wss    = new WebSocket.Server({ server });
+// local ws clients per session on THIS instance only
+// redis handles cross-instance stuff, this handles local forwarding
+const localClients = new Map(); // sessionId -> Set of ws
 
-// ─── REST ROUTES ────────────────────────────────────────
+async function initRedis() {
+  await publisher.connect();
+  await subscriber.connect();
+  console.log('redis connected');
 
-app.post('/session/create', (req, res) => {
-  const sessionId = uuidv4();
-  const { userId } = req.body;
+  // listen for messages published by ANY instance and forward to local ws clients
+  await subscriber.pSubscribe('session:*', (raw, channel) => {
+    const sessionId = channel.replace('session:', '');
+    const clients = localClients.get(sessionId);
+    if (!clients) return;
 
-  sessions.set(sessionId, {
-    createdBy:   userId || 'anonymous',
-    createdAt:   Date.now(),
-    clients:     [],
-    users:       [],
-    breakpoints: [],
-    variables:   {},
-  });
-
-  res.status(201).json({ sessionId });
-});
-
-app.post('/session/join', (req, res) => {
-  const { sessionId, userId } = req.body;
-  if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
-
-  const session = sessions.get(sessionId);
-  if (!session) return res.status(404).json({ error: 'Session not found' });
-
-  res.status(200).json({
-    message:     'Joined successfully',
-    sessionId,
-    createdBy:   session.createdBy,
-    createdAt:   session.createdAt,
-    clientCount: session.clients.length,
-  });
-});
-
-app.get('/session/:id', (req, res) => {
-  const session = sessions.get(req.params.id);
-  if (!session) return res.status(404).json({ error: 'Session not found' });
-
-  res.json({
-    sessionId:   req.params.id,
-    createdBy:   session.createdBy,
-    createdAt:   session.createdAt,
-    clientCount: session.clients.length,
-    userCount:   session.users.length,
-    breakpoints: session.breakpoints,
-  });
-});
-
-// ─── Helpers ────────────────────────────────────────────
-
-/**
- * Broadcasts a message to all connected clients in a session.
- * @param {string} sessionId - Target session ID
- * @param {object} message - Event object following the standard schema
- * @param {WebSocket|null} excludeClient - Client to skip (usually the sender)
- */
-function broadcastToSession(sessionId, message, excludeClient = null) {
-  const session = sessions.get(sessionId);
-  if (!session) return;
-
-  messageSequence++;
-  const payload = JSON.stringify({ ...message, seq: messageSequence });
-
-  session.clients.forEach(client => {
-    if (client === excludeClient) return;
-    if (client.readyState === WebSocket.OPEN) client.send(payload);
+    clients.forEach(ws => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(raw);
+    });
   });
 }
 
-/**
- * Sends a structured error event back to a single client.
- * @param {WebSocket} ws - Client to notify
- * @param {string} sessionId - Session context
- * @param {string} message - Human-readable error description
- * @param {string} originalType - The event type that caused the error
- */
+initRedis().catch(err => {
+  console.error('redis init failed:', err);
+  process.exit(1); // no point running without redis in prod
+});
+
+// ─── Session helpers (redis instead of Map) ──────────────
+
+const SESSION_TTL = 60 * 60 * 24; // 24 hours, sessions auto-cleanup
+
+async function getSession(sessionId) {
+  const data = await publisher.get(`sessiondata:${sessionId}`);
+  return data ? JSON.parse(data) : null;
+}
+
+async function saveSession(sessionId, session) {
+  // dont store ws refs in redis, only serialisable stuff
+  const toStore = {
+    createdBy:   session.createdBy,
+    createdAt:   session.createdAt,
+    breakpoints: session.breakpoints,
+    variables:   session.variables,
+    users:       session.users.map(u => ({
+      userId: u.userId, userName: u.userName, userColor: u.userColor
+      // intentionally dropping u.ws - cant serialise that
+    })),
+  };
+  await publisher.set(`sessiondata:${sessionId}`, JSON.stringify(toStore), { EX: SESSION_TTL });
+}
+
+async function deleteSession(sessionId) {
+  await publisher.del(`sessiondata:${sessionId}`);
+}
+
+// publish to redis so ALL instances get it and forward to their local ws clients
+let messageSequence = 0;
+
+async function broadcastToSession(sessionId, message, excludeWs = null) {
+  messageSequence++;
+  const payload = { ...message, seq: messageSequence };
+
+  // if excludeWs is set, send to local clients directly (skip the excluded one)
+  // then publish to redis for other instances
+  const localSet = localClients.get(sessionId);
+  if (localSet) {
+    localSet.forEach(ws => {
+      if (ws === excludeWs) return;
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
+    });
+  }
+
+  // other instances pick this up via pSubscribe above
+  await publisher.publish(`session:${sessionId}`, JSON.stringify(payload));
+}
+
 function sendError(ws, sessionId, message, originalType = null) {
   ws.send(JSON.stringify({
     type:      'ERROR',
@@ -102,18 +99,76 @@ function sendError(ws, sessionId, message, originalType = null) {
   }));
 }
 
-/**
- * Pings all connected clients every 30s.
- * Terminates clients that do not respond with a pong.
- * @param {WebSocket.Server} wss
- */
+// ─── HTTP + WebSocket server ──────────────────────────────
+const server = http.createServer(app);
+const wss    = new WebSocket.Server({ server });
+
+// ─── REST ROUTES ──────────────────────────────────────────
+
+app.post('/session/create', async (req, res) => {
+  try {
+    const sessionId = uuidv4();
+    const { userId } = req.body;
+
+    const session = {
+      createdBy:   userId || 'anonymous',
+      createdAt:   Date.now(),
+      breakpoints: [],
+      variables:   {},
+      users:       [],
+    };
+
+    await saveSession(sessionId, session);
+    res.status(201).json({ sessionId });
+  } catch (err) {
+    console.error('create session error:', err);
+    res.status(500).json({ error: 'failed to create session' });
+  }
+});
+
+app.post('/session/join', async (req, res) => {
+  try {
+    const { sessionId, userId } = req.body;
+    if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
+
+    const session = await getSession(sessionId);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+
+    res.status(200).json({
+      message:     'Joined successfully',
+      sessionId,
+      createdBy:   session.createdBy,
+      createdAt:   session.createdAt,
+      clientCount: session.users.length,
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'failed to join session' });
+  }
+});
+
+app.get('/session/:id', async (req, res) => {
+  try {
+    const session = await getSession(req.params.id);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+
+    res.json({
+      sessionId:   req.params.id,
+      createdBy:   session.createdBy,
+      createdAt:   session.createdAt,
+      userCount:   session.users.length,
+      breakpoints: session.breakpoints,
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'failed to get session' });
+  }
+});
+
+// ─── Heartbeat ────────────────────────────────────────────
+
 function startHeartbeat(wss) {
   setInterval(() => {
-    wss.clients.forEach((ws) => {
-      if (ws.isAlive === false) {
-        ws.terminate();
-        return;
-      }
+    wss.clients.forEach(ws => {
+      if (ws.isAlive === false) { ws.terminate(); return; }
       ws.isAlive = false;
       ws.ping();
     });
@@ -122,9 +177,9 @@ function startHeartbeat(wss) {
 
 startHeartbeat(wss);
 
-// ─── WebSocket ──────────────────────────────────────────
+// ─── WebSocket ────────────────────────────────────────────
 
-wss.on('connection', (ws, req) => {
+wss.on('connection', async (ws, req) => {
   const params    = new URLSearchParams(req.url.replace('/?', ''));
   const sessionId = params.get('sessionId');
   const userId    = params.get('userId');
@@ -133,22 +188,24 @@ wss.on('connection', (ws, req) => {
 
   if (!sessionId) { ws.close(4000, 'sessionId is required'); return; }
 
-  const session = sessions.get(sessionId);
+  const session = await getSession(sessionId);
   if (!session) { ws.close(4004, 'Session not found'); return; }
 
-  // reconnection — update ws ref instead of duplicating user entry
-  const existingIndex = session.users.findIndex(u => u.userId === userId);
-  if (existingIndex !== -1) {
-    session.users[existingIndex].ws = ws;
-  } else {
-    session.users.push({ userId, userName, userColor, ws });
-  }
+  // track ws locally (cant go in redis)
+  if (!localClients.has(sessionId)) localClients.set(sessionId, new Set());
+  localClients.get(sessionId).add(ws);
 
-  session.clients.push(ws);
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
-  // send full session state to the new joiner
+  // handle reconnection - dont duplicate user in session
+  const existingUser = session.users.find(u => u.userId === userId);
+  if (!existingUser) {
+    session.users.push({ userId, userName, userColor });
+    await saveSession(sessionId, session);
+  }
+
+  // send snapshot to the new joiner only
   ws.send(JSON.stringify({
     type:      'SESSION_SNAPSHOT',
     seq:       ++messageSequence,
@@ -157,24 +214,21 @@ wss.on('connection', (ws, req) => {
     userName:  'server',
     userColor: null,
     payload: {
-      breakpoints: session.breakpoints,
-      variables:   session.variables,
-      users:       session.users.map(u => ({
-        userId: u.userId, userName: u.userName, userColor: u.userColor,
-      })),
+      breakpoints:  session.breakpoints,
+      variables:    session.variables,
+      presentUsers: session.users,
     },
     timestamp: new Date().toISOString(),
   }));
 
-  // notify existing members
-  broadcastToSession(sessionId, {
+  // tell everyone else someone joined
+  await broadcastToSession(sessionId, {
     type: 'USER_JOINED', sessionId, userId, userName, userColor,
     payload: {}, timestamp: new Date().toISOString(),
   }, ws);
 
-  ws.on('message', (raw) => {
+  ws.on('message', async (raw) => {
     let msg;
-
     try {
       msg = JSON.parse(raw);
     } catch {
@@ -183,6 +237,11 @@ wss.on('connection', (ws, req) => {
     }
 
     if (!msg.timestamp) msg.timestamp = new Date().toISOString();
+
+    // refetch session from redis on each message so we have latest state
+    // across all instances
+    const current = await getSession(sessionId);
+    if (!current) { sendError(ws, sessionId, 'Session expired'); return; }
 
     try {
       switch (msg.type) {
@@ -200,16 +259,21 @@ wss.on('connection', (ws, req) => {
           if (!file || !line || !action) throw new Error('missing file/line/action');
 
           if (action === 'add') {
-            const exists = session.breakpoints.some(b => b.file === file && b.line === line);
-            if (!exists) session.breakpoints.push({ file, line, userName: msg.userName, userColor: msg.userColor });
-          }
-          if (action === 'remove') {
-            session.breakpoints = session.breakpoints.filter(
-              b => !(b.file === file && b.line === line)
-            );
+            const exists = current.breakpoints.some(b => b.file === file && b.line === line);
+            if (!exists) {
+              current.breakpoints.push({ file, line, userName: msg.userName, userColor: msg.userColor });
+              await saveSession(sessionId, current);
+            }
           }
 
-          broadcastToSession(sessionId, {
+          if (action === 'remove') {
+            current.breakpoints = current.breakpoints.filter(
+              b => !(b.file === file && b.line === line)
+            );
+            await saveSession(sessionId, current);
+          }
+
+          await broadcastToSession(sessionId, {
             type:      action === 'add' ? 'BREAKPOINT_HIT' : 'BREAKPOINT_REMOVED',
             sessionId, userId: msg.userId, userName: msg.userName, userColor: msg.userColor,
             payload:   { file, line },
@@ -220,9 +284,10 @@ wss.on('connection', (ws, req) => {
 
         case 'variable-state': {
           if (!msg.payload?.scopes) throw new Error('missing scopes');
-          session.variables = msg.payload.scopes;
+          current.variables = msg.payload.scopes;
+          await saveSession(sessionId, current);
 
-          broadcastToSession(sessionId, {
+          await broadcastToSession(sessionId, {
             type:      'VARIABLE_UPDATE',
             sessionId, userId: msg.userId, userName: msg.userName, userColor: msg.userColor,
             payload:   { scopes: msg.payload.scopes },
@@ -234,38 +299,48 @@ wss.on('connection', (ws, req) => {
         default:
           break;
       }
-
     } catch (err) {
       sendError(ws, sessionId, err.message, msg.type);
     }
   });
 
-  ws.on('close', () => {
-    session.clients = session.clients.filter(c => c !== ws);
-    session.users   = session.users.filter(u => u.userId !== userId);
+  ws.on('close', async () => {
+    // remove from local tracking
+    const set = localClients.get(sessionId);
+    if (set) {
+      set.delete(ws);
+      if (set.size === 0) localClients.delete(sessionId);
+    }
 
-    if (session.clients.length > 0) {
-      broadcastToSession(sessionId, {
+    const current = await getSession(sessionId);
+    if (!current) return;
+
+    current.users = current.users.filter(u => u.userId !== userId);
+    await saveSession(sessionId, current);
+
+    if (current.users.length > 0) {
+      await broadcastToSession(sessionId, {
         type: 'USER_LEFT', sessionId, userId, userName, userColor,
         payload: {}, timestamp: new Date().toISOString(),
       });
-    }
 
-    if (session.createdBy === userId && session.users.length > 0) {
-      session.createdBy = session.users[0].userId;
-      broadcastToSession(sessionId, {
-        type: 'HOST_CHANGED', sessionId,
-        userId: 'server', userName: 'server', userColor: null,
-        payload: { newHost: session.createdBy },
-        timestamp: new Date().toISOString(),
-      });
-    }
-
-    if (session.clients.length === 0) {
-      setTimeout(() => {
-        const current = sessions.get(sessionId);
-        if (current && current.clients.length === 0) {
-          sessions.delete(sessionId);
+      // transfer host if the creator left
+      if (current.createdBy === userId) {
+        current.createdBy = current.users[0].userId;
+        await saveSession(sessionId, current);
+        await broadcastToSession(sessionId, {
+          type: 'HOST_CHANGED', sessionId,
+          userId: 'server', userName: 'server', userColor: null,
+          payload: { newHost: current.createdBy },
+          timestamp: new Date().toISOString(),
+        });
+      }
+    } else {
+      // nobody left in session, clean up after 5s in case of page refresh
+      setTimeout(async () => {
+        const check = await getSession(sessionId);
+        if (check && check.users.length === 0) {
+          await deleteSession(sessionId);
         }
       }, 5000);
     }
@@ -277,4 +352,4 @@ wss.on('connection', (ws, req) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`server running on port ${PORT}`));
