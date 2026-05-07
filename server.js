@@ -6,11 +6,6 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 app.use(express.json());
 
-app.use((req, res, next) => {
-  console.log('REQUEST:', req.method, req.url);
-  next();
-});
-
 // ─── In-memory session store ────────────────────────────
 const sessions = new Map();
 let messageSequence = 0;
@@ -34,7 +29,6 @@ app.post('/session/create', (req, res) => {
     variables:   {},
   });
 
-  console.log(`[SESSION CREATED] sessionId=${sessionId} by userId=${userId}`);
   res.status(201).json({ sessionId });
 });
 
@@ -45,7 +39,6 @@ app.post('/session/join', (req, res) => {
   const session = sessions.get(sessionId);
   if (!session) return res.status(404).json({ error: 'Session not found' });
 
-  console.log(`[SESSION JOINED] sessionId=${sessionId} by userId=${userId}`);
   res.status(200).json({
     message:     'Joined successfully',
     sessionId,
@@ -69,7 +62,14 @@ app.get('/session/:id', (req, res) => {
   });
 });
 
-// ─── Broadcast helper ───────────────────────────────────
+// ─── Helpers ────────────────────────────────────────────
+
+/**
+ * Broadcasts a message to all connected clients in a session.
+ * @param {string} sessionId - Target session ID
+ * @param {object} message - Event object following the standard schema
+ * @param {WebSocket|null} excludeClient - Client to skip (usually the sender)
+ */
 function broadcastToSession(sessionId, message, excludeClient = null) {
   const session = sessions.get(sessionId);
   if (!session) return;
@@ -83,12 +83,34 @@ function broadcastToSession(sessionId, message, excludeClient = null) {
   });
 }
 
-// ─── Heartbeat ──────────────────────────────────────────
+/**
+ * Sends a structured error event back to a single client.
+ * @param {WebSocket} ws - Client to notify
+ * @param {string} sessionId - Session context
+ * @param {string} message - Human-readable error description
+ * @param {string} originalType - The event type that caused the error
+ */
+function sendError(ws, sessionId, message, originalType = null) {
+  ws.send(JSON.stringify({
+    type:      'ERROR',
+    sessionId,
+    userId:    'server',
+    userName:  'server',
+    userColor: null,
+    payload:   { message, originalType },
+    timestamp: new Date().toISOString(),
+  }));
+}
+
+/**
+ * Pings all connected clients every 30s.
+ * Terminates clients that do not respond with a pong.
+ * @param {WebSocket.Server} wss
+ */
 function startHeartbeat(wss) {
   setInterval(() => {
     wss.clients.forEach((ws) => {
       if (ws.isAlive === false) {
-        console.log('[HEARTBEAT] client unresponsive — terminating');
         ws.terminate();
         return;
       }
@@ -101,6 +123,7 @@ function startHeartbeat(wss) {
 startHeartbeat(wss);
 
 // ─── WebSocket ──────────────────────────────────────────
+
 wss.on('connection', (ws, req) => {
   const params    = new URLSearchParams(req.url.replace('/?', ''));
   const sessionId = params.get('sessionId');
@@ -113,11 +136,10 @@ wss.on('connection', (ws, req) => {
   const session = sessions.get(sessionId);
   if (!session) { ws.close(4004, 'Session not found'); return; }
 
-  // reconnection — update ws ref instead of duplicating
+  // reconnection — update ws ref instead of duplicating user entry
   const existingIndex = session.users.findIndex(u => u.userId === userId);
   if (existingIndex !== -1) {
     session.users[existingIndex].ws = ws;
-    console.log(`[WS RECONNECT] userId=${userId} sessionId=${sessionId}`);
   } else {
     session.users.push({ userId, userName, userColor, ws });
   }
@@ -126,9 +148,7 @@ wss.on('connection', (ws, req) => {
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
-  console.log(`[WS CONNECT] sessionId=${sessionId} userId=${userId} | clients=${session.clients.length}`);
-
-  // snapshot to new joiner
+  // send full session state to the new joiner
   ws.send(JSON.stringify({
     type:      'SESSION_SNAPSHOT',
     seq:       ++messageSequence,
@@ -146,22 +166,19 @@ wss.on('connection', (ws, req) => {
     timestamp: new Date().toISOString(),
   }));
 
-  // tell others someone joined
+  // notify existing members
   broadcastToSession(sessionId, {
     type: 'USER_JOINED', sessionId, userId, userName, userColor,
     payload: {}, timestamp: new Date().toISOString(),
   }, ws);
 
-  // ── Messages ─────────────────────────────────────────
   ws.on('message', (raw) => {
     let msg;
+
     try {
       msg = JSON.parse(raw);
     } catch {
-      ws.send(JSON.stringify({
-        type: 'ERROR', sessionId, userId: 'server', userName: 'server', userColor: null,
-        payload: { message: 'Invalid JSON' }, timestamp: new Date().toISOString(),
-      }));
+      sendError(ws, sessionId, 'Invalid JSON');
       return;
     }
 
@@ -172,8 +189,9 @@ wss.on('connection', (ws, req) => {
 
         case 'ping':
           ws.send(JSON.stringify({
-            type: 'pong', sessionId, userId: 'server', userName: 'server',
-            userColor: null, payload: {}, timestamp: new Date().toISOString(),
+            type: 'pong', sessionId,
+            userId: 'server', userName: 'server', userColor: null,
+            payload: {}, timestamp: new Date().toISOString(),
           }));
           break;
 
@@ -186,7 +204,9 @@ wss.on('connection', (ws, req) => {
             if (!exists) session.breakpoints.push({ file, line, userName: msg.userName, userColor: msg.userColor });
           }
           if (action === 'remove') {
-            session.breakpoints = session.breakpoints.filter(b => !(b.file === file && b.line === line));
+            session.breakpoints = session.breakpoints.filter(
+              b => !(b.file === file && b.line === line)
+            );
           }
 
           broadcastToSession(sessionId, {
@@ -212,25 +232,17 @@ wss.on('connection', (ws, req) => {
         }
 
         default:
-          console.warn(`[WS UNKNOWN TYPE] type=${msg.type}`);
+          break;
       }
 
     } catch (err) {
-      console.error(`[WS HANDLER ERROR] type=${msg.type} | ${err.message}`);
-      ws.send(JSON.stringify({
-        type: 'ERROR', sessionId, userId: 'server', userName: 'server', userColor: null,
-        payload: { message: err.message, originalType: msg.type },
-        timestamp: new Date().toISOString(),
-      }));
+      sendError(ws, sessionId, err.message, msg.type);
     }
   });
 
-  // ── Disconnect ────────────────────────────────────────
   ws.on('close', () => {
     session.clients = session.clients.filter(c => c !== ws);
     session.users   = session.users.filter(u => u.userId !== userId);
-
-    console.log(`[WS DISCONNECT] sessionId=${sessionId} userId=${userId} | remaining=${session.clients.length}`);
 
     if (session.clients.length > 0) {
       broadcastToSession(sessionId, {
@@ -241,10 +253,11 @@ wss.on('connection', (ws, req) => {
 
     if (session.createdBy === userId && session.users.length > 0) {
       session.createdBy = session.users[0].userId;
-      console.log(`[HOST TRANSFER] new host=${session.createdBy}`);
       broadcastToSession(sessionId, {
-        type: 'HOST_CHANGED', sessionId, userId: 'server', userName: 'server', userColor: null,
-        payload: { newHost: session.createdBy }, timestamp: new Date().toISOString(),
+        type: 'HOST_CHANGED', sessionId,
+        userId: 'server', userName: 'server', userColor: null,
+        payload: { newHost: session.createdBy },
+        timestamp: new Date().toISOString(),
       });
     }
 
@@ -253,14 +266,13 @@ wss.on('connection', (ws, req) => {
         const current = sessions.get(sessionId);
         if (current && current.clients.length === 0) {
           sessions.delete(sessionId);
-          console.log(`[SESSION DELETED] sessionId=${sessionId}`);
         }
       }, 5000);
     }
   });
 
   ws.on('error', (err) => {
-    console.error(`[WS ERROR] sessionId=${sessionId} userId=${userId} | ${err.message}`);
+    sendError(ws, sessionId, err.message);
   });
 });
 
