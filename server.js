@@ -6,7 +6,14 @@ const { createClient } = require('redis');
 
 const app = express();
 app.use(express.json());
-
+app.use(cors({
+  origin: [
+    'http://localhost:5173',
+    'https://debugger-dashboard.vercel.app',
+    'https://debugger-dashbo-git-209dbb-aishwaryakurakula2511-9422s-projects.vercel.app'
+  ],
+  credentials: true
+}));
 // ─── Redis setup ─────────────────────────────────────────
 // two clients needed - one cant both publish and subscribe at the same time
 const publisher  = createClient({ url: process.env.REDIS_URL });
