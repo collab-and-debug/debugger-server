@@ -3,6 +3,7 @@ const http      = require('http');
 const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
 const { createClient } = require('redis');
+const cors = require('cors'); 
 
 const app = express();
 app.use(express.json());
