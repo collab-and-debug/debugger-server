@@ -20,13 +20,10 @@ app.use(cors({
   },
   credentials: true
 }));
-// ─── Redis setup ─────────────────────────────────────────
-// two clients needed - one cant both publish and subscribe at the same time
+
 const publisher  = createClient({ url: process.env.REDIS_URL });
 const subscriber = createClient({ url: process.env.REDIS_URL });
 
-// local ws clients per session on THIS instance only
-// redis handles cross-instance stuff, this handles local forwarding
 const localClients = new Map(); // sessionId -> Set of ws
 
 async function initRedis() {
@@ -34,13 +31,16 @@ async function initRedis() {
   await subscriber.connect();
   console.log('redis connected');
 
-  // listen for messages published by ANY instance and forward to local ws clients
   await subscriber.pSubscribe('session:*', (raw, channel) => {
     const sessionId = channel.replace('session:', '');
     const clients = localClients.get(sessionId);
     if (!clients) return;
 
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
     clients.forEach(ws => {
+      if (ws.userId && msg.excludeUserId && ws.userId === msg.excludeUserId) return;
       if (ws.readyState === WebSocket.OPEN) ws.send(raw);
     });
   });
@@ -48,12 +48,10 @@ async function initRedis() {
 
 initRedis().catch(err => {
   console.error('redis init failed:', err);
-  process.exit(1); // no point running without redis in prod
+  process.exit(1);
 });
 
-// ─── Session helpers (redis instead of Map) ──────────────
-
-const SESSION_TTL = 60 * 60 * 24; // 24 hours, sessions auto-cleanup
+const SESSION_TTL = 60 * 60 * 24;
 
 async function getSession(sessionId) {
   const data = await publisher.get(`sessiondata:${sessionId}`);
@@ -61,7 +59,6 @@ async function getSession(sessionId) {
 }
 
 async function saveSession(sessionId, session) {
-  // dont store ws refs in redis, only serialisable stuff
   const toStore = {
     createdBy:   session.createdBy,
     createdAt:   session.createdAt,
@@ -69,7 +66,6 @@ async function saveSession(sessionId, session) {
     variables:   session.variables,
     users:       session.users.map(u => ({
       userId: u.userId, userName: u.userName, userColor: u.userColor
-      // intentionally dropping u.ws - cant serialise that
     })),
   };
   await publisher.set(`sessiondata:${sessionId}`, JSON.stringify(toStore), { EX: SESSION_TTL });
@@ -79,24 +75,11 @@ async function deleteSession(sessionId) {
   await publisher.del(`sessiondata:${sessionId}`);
 }
 
-// publish to redis so ALL instances get it and forward to their local ws clients
 let messageSequence = 0;
 
-async function broadcastToSession(sessionId, message, excludeWs = null) {
+async function broadcastToSession(sessionId, message, excludeUserId = null) {
   messageSequence++;
-  const payload = { ...message, seq: messageSequence };
-
-  // if excludeWs is set, send to local clients directly (skip the excluded one)
-  // then publish to redis for other instances
-  const localSet = localClients.get(sessionId);
-  if (localSet) {
-    localSet.forEach(ws => {
-      if (ws === excludeWs) return;
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
-    });
-  }
-
-  // other instances pick this up via pSubscribe above
+  const payload = { ...message, seq: messageSequence, excludeUserId };
   await publisher.publish(`session:${sessionId}`, JSON.stringify(payload));
 }
 
@@ -112,11 +95,8 @@ function sendError(ws, sessionId, message, originalType = null) {
   }));
 }
 
-// ─── HTTP + WebSocket server ──────────────────────────────
 const server = http.createServer(app);
 const wss    = new WebSocket.Server({ server });
-
-// ─── REST ROUTES ──────────────────────────────────────────
 
 app.post('/session/create', async (req, res) => {
   try {
@@ -176,8 +156,6 @@ app.get('/session/:id', async (req, res) => {
   }
 });
 
-// ─── Heartbeat ────────────────────────────────────────────
-
 function startHeartbeat(wss) {
   setInterval(() => {
     wss.clients.forEach(ws => {
@@ -189,8 +167,6 @@ function startHeartbeat(wss) {
 }
 
 startHeartbeat(wss);
-
-// ─── WebSocket ────────────────────────────────────────────
 
 wss.on('connection', async (ws, req) => {
   const params    = new URLSearchParams(req.url.replace('/?', ''));
@@ -204,21 +180,19 @@ wss.on('connection', async (ws, req) => {
   const session = await getSession(sessionId);
   if (!session) { ws.close(4004, 'Session not found'); return; }
 
-  // track ws locally (cant go in redis)
   if (!localClients.has(sessionId)) localClients.set(sessionId, new Set());
   localClients.get(sessionId).add(ws);
 
   ws.isAlive = true;
+  ws.userId = userId;
   ws.on('pong', () => { ws.isAlive = true; });
 
-  // handle reconnection - dont duplicate user in session
   const existingUser = session.users.find(u => u.userId === userId);
   if (!existingUser) {
     session.users.push({ userId, userName, userColor });
     await saveSession(sessionId, session);
   }
 
-  // send snapshot to the new joiner only
   ws.send(JSON.stringify({
     type:      'SESSION_SNAPSHOT',
     seq:       ++messageSequence,
@@ -234,11 +208,10 @@ wss.on('connection', async (ws, req) => {
     timestamp: new Date().toISOString(),
   }));
 
-  // tell everyone else someone joined
   await broadcastToSession(sessionId, {
     type: 'USER_JOINED', sessionId, userId, userName, userColor,
     payload: {}, timestamp: new Date().toISOString(),
-  }, ws);
+  }, userId);
 
   ws.on('message', async (raw) => {
     let msg;
@@ -251,8 +224,6 @@ wss.on('connection', async (ws, req) => {
 
     if (!msg.timestamp) msg.timestamp = new Date().toISOString();
 
-    // refetch session from redis on each message so we have latest state
-    // across all instances
     const current = await getSession(sessionId);
     if (!current) { sendError(ws, sessionId, 'Session expired'); return; }
 
@@ -291,7 +262,7 @@ wss.on('connection', async (ws, req) => {
             sessionId, userId: msg.userId, userName: msg.userName, userColor: msg.userColor,
             payload:   { file, line },
             timestamp: msg.timestamp,
-          }, ws);
+          }, msg.userId);
           break;
         }
 
@@ -305,7 +276,7 @@ wss.on('connection', async (ws, req) => {
             sessionId, userId: msg.userId, userName: msg.userName, userColor: msg.userColor,
             payload:   { scopes: msg.payload.scopes },
             timestamp: msg.timestamp,
-          }, ws);
+          }, msg.userId);
           break;
         }
 
@@ -318,7 +289,6 @@ wss.on('connection', async (ws, req) => {
   });
 
   ws.on('close', async () => {
-    // remove from local tracking
     const set = localClients.get(sessionId);
     if (set) {
       set.delete(ws);
@@ -335,9 +305,8 @@ wss.on('connection', async (ws, req) => {
       await broadcastToSession(sessionId, {
         type: 'USER_LEFT', sessionId, userId, userName, userColor,
         payload: {}, timestamp: new Date().toISOString(),
-      });
+      }, userId);
 
-      // transfer host if the creator left
       if (current.createdBy === userId) {
         current.createdBy = current.users[0].userId;
         await saveSession(sessionId, current);
@@ -346,10 +315,9 @@ wss.on('connection', async (ws, req) => {
           userId: 'server', userName: 'server', userColor: null,
           payload: { newHost: current.createdBy },
           timestamp: new Date().toISOString(),
-        });
+        }, null);
       }
     } else {
-      // nobody left in session, clean up after 5s in case of page refresh
       setTimeout(async () => {
         const check = await getSession(sessionId);
         if (check && check.users.length === 0) {
