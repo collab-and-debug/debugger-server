@@ -111,12 +111,12 @@ Every message follows this shape:
 
 ---
 
-## Deploy to Railway
+## Deploy to Render
 
 1. Push repo to GitHub
-2. Go to [railway.app](https://railway.app) → New Project → Deploy from GitHub
+2. Go to [render.app](https://render.app) → New Project → Deploy from GitHub
 3. Set env var: `PORT=3000`
-4. Railway gives you a public URL — share with team
+4. Render gives you a public URL — share with team
 
-WebSocket URL will be: `wss://your-app.railway.app?sessionId=...`  
+WebSocket URL will be: `wss://your-app.render.app?sessionId=...`  
 Note: Railway uses `wss://` (secure) not `ws://` — update your frontend hook URL accordingly.
