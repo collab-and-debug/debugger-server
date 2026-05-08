@@ -8,11 +8,16 @@ const cors = require('cors');
 const app = express();
 app.use(express.json());
 app.use(cors({
-  origin: [
-    'http://localhost:5173',
-    'https://debugger-dashboard.vercel.app',
-    'https://debugger-dashbo-git-209dbb-aishwaryakurakula2511-9422s-projects.vercel.app'
-  ],
+  origin: function(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (
+      origin.endsWith('.vercel.app') ||
+      origin === 'http://localhost:5173'
+    ) {
+      return callback(null, true);
+    }
+    callback(new Error('Not allowed by CORS'));
+  },
   credentials: true
 }));
 // ─── Redis setup ─────────────────────────────────────────
