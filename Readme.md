@@ -1,17 +1,17 @@
 # collab-debug — Debugging Server
 
-Real-time collaborative debugging server. Manages sessions, broadcasts debug events, and delivers state snapshots to late joiners.
+Server for real-time collaborative debugging. Handles sessions, publishes debug events, and sends state snapshots to new clients.
 
 ---
 
-## Run locally
+## Local deployment
 
 ```bash
 npm install
-npm start          # runs on port 3000
+npm start          # listens at port 3000
 ```
 
-For dev with auto-restart:
+Local development with automatic restart:
 ```bash
 npm install -g nodemon
 nodemon server.js
@@ -19,37 +19,37 @@ nodemon server.js
 
 ---
 
-## Environment variables
+## Environmental variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT`   | `3000`  | Server port |
+| Env Var Name | Default Value | Description |
+|--------------|---------------|-------------|
+| `PORT`       | `3000`        | Listening port |
 
 ---
 
-## REST endpoints
+## REST API
 
 ### `POST /session/create`
-Creates a new session.
+Create a session.
 
-**Body:** `{ "userId": "string" }`  
-**Response:** `{ "sessionId": "uuid" }`
+**Input body:** `{ "userId": "string" }`  
+**Return value:** `{ "sessionId": "uuid" }`
 
 ---
 
 ### `POST /session/join`
-Validates a session exists before the client opens a WebSocket.
+Before establishing Websocket, verify the session is valid.
 
-**Body:** `{ "sessionId": "string", "userId": "string" }`  
-**Response:** `{ "sessionId", "createdBy", "createdAt", "clientCount" }`  
-**Errors:** `404` if session not found
+**Input body:** `{ "sessionId": "string", "userId": "string" }`  
+**Return value:** `{ "sessionId", "createdBy", "createdAt", "clientCount" }`  
+**Possible errors:** `404` if no such session.
 
 ---
 
 ### `GET /session/:id`
-Debug endpoint — returns current session state.
+Debugger endpoint to get session information.
 
-**Response:** `{ "sessionId", "createdBy", "clientCount", "breakpoints" }`
+**Return value:** `{ "sessionId", "createdBy", "clientCount", "breakpoints" }`
 
 ---
 
@@ -60,15 +60,15 @@ Connect to:
 ws://your-server?sessionId=xxx&userId=yyy&userName=zzz&userColor=%23a3f21b
 ```
 
-`userColor` must be URL-encoded (e.g. `#a3f21b` → `%23a3f21b`).
+`userColor` is encoded using the URL format (e.g. `#a3f21b` should become `%23a3f21b`).
 
-On connect, server immediately sends a `SESSION_SNAPSHOT` with current state.
+Immediately after connecting, server sends the client a `SESSION_SNAPSHOT` with the session data.
 
 ---
 
-## Event schema
+## Message structure
 
-Every message follows this shape:
+All messages have the following fields:
 
 ```json
 {
@@ -85,38 +85,39 @@ Every message follows this shape:
 
 ---
 
-## Event types
+## Message types
 
 ### Client → Server
 
-| type | payload | description |
-|------|---------|-------------|
-| `ping` | `{}` | keepalive check |
-| `breakpoint` | `{ file, line, action: "add"/"remove" }` | add or remove a breakpoint |
-| `variable-state` | `{ scopes: { local: {}, global: {} } }` | latest variable snapshot |
+| Type     | Payload                                  | Description                           |
+|----------|------------------------------------------|---------------------------------------|
+| `ping`   | `{}`                                     | Keepalive request                     |
+| `breakpoint` | `{ file, line, action: "add"/"remove" }` | Create/destroy a breakpoint           |
+| `variable-state` | `{ scopes: { local: {}, global: {} } }` | Variable snapshot                    |
 
 ### Server → Client
 
-| type | payload | description |
-|------|---------|-------------|
-| `pong` | `{}` | response to ping |
-| `SESSION_SNAPSHOT` | `{ breakpoints, variables, users }` | full state on connect |
-| `BREAKPOINT_HIT` | `{ file, line }` | breakpoint added |
-| `BREAKPOINT_REMOVED` | `{ file, line }` | breakpoint removed |
-| `VARIABLE_UPDATE` | `{ scopes }` | variables changed |
-| `USER_JOINED` | `{}` | someone connected |
-| `USER_LEFT` | `{}` | someone disconnected |
-| `HOST_CHANGED` | `{ newHost }` | original host left, new host assigned |
-| `ERROR` | `{ message, originalType }` | bad message received |
+| Type                | Payload                          | Description                           |
+|---------------------|----------------------------------|---------------------------------------|
+| `pong`              | `{}`                             | Pong                                   |
+| `SESSION_SNAPSHOT`  | `{ breakpoints, variables, users }` | Session data after connection         |
+| `BREAKPOINT_HIT`    | `{ file, line }`                 | Added a breakpoint                    |
+| `BREAKPOINT_REMOVED` | `{ file, line }`                 | Destroyed a breakpoint                |
+| `VARIABLE_UPDATE`   | `{ scopes }`                     | Variables were updated                 |
+| `USER_JOINED`       | `{}`                             | Another user joined                    |
+| `USER_LEFT`         | `{}`                             | Another user has left                  |
+| `HOST_CHANGED`      | `{ newHost }`                    | Host has left and now new host controls|
+| `ERROR`             | `{ message, originalType }`        | Bad message received                 |
 
 ---
 
-## Deploy to Render
+## Deployment on Render
 
-1. Push repo to GitHub
-2. Go to [render.app](https://render.app) → New Project → Deploy from GitHub
-3. Set env var: `PORT=3000`
-4. Render gives you a public URL — share with team
+1. Commit changes to GitHub.
+2. Visit [render.app](https://render.app) → New Project → Deploy from GitHub.
+3. Set environment variable: `PORT=3000`.
+4. Render assigns a public URL, which can be shared with team.
 
-WebSocket URL will be: `wss://your-app.render.app?sessionId=...`  
-Note: Railway uses `wss://` (secure) not `ws://` — update your frontend hook URL accordingly.
+The websocket address will look like `wss://your-app.render.app?sessionId=...`.
+
+Note: Railway
